@@ -1,0 +1,19 @@
+[package]
+name = "actix-mqtt"
+version = "0.1.0"
+authors = ["Ryan Roberts <ryansroberts@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+actix = {version = "*", features = ["resolver"]}
+actix_derive = "*"
+bytes = "*"
+rustls = "*"
+mqtt3 = "*"
+failure = "*"
+futures = "*"
+tokio-rustls = "*"
+tokio = "*"
+tokio-io = "*"
+tokio-tcp = "*"
+tokio-uds = "*"
