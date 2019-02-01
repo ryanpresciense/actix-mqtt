@@ -1,7 +1,7 @@
 use crate::iostream::IoStream;
 use actix::actors::resolver::{Resolve, Resolver, ResolverError};
 use actix::fut::{WrapFuture};
-use actix::{Actor, ActorResponse, Context, Handler, MailboxError, Message};
+use actix::{Actor, ActorResponse, Context, Handler, MailboxError, Message,SystemService,Supervised};
 use failure::Fail;
 use futures::{Future,  Poll};
 use std::collections::VecDeque;
@@ -38,8 +38,12 @@ impl Message for Connect {
     type Result = Result<Connection, ConnectError>;
 }
 
-#[derive(Debug)]
+#[derive(Debug,Default)]
 pub struct Connector {}
+
+impl Supervised for Connector {}
+
+impl SystemService for Connector {}
 
 impl Connector {
     fn resolve(addr: Resolve) -> impl Future<Item = VecDeque<SocketAddr>, Error = ConnectError> {
