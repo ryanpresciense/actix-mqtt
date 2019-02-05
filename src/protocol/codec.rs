@@ -1,35 +1,18 @@
 use super::mqtt::{Connack, Connect, Packet, Publish, Suback, Subscribe, Unsubscribe};
 use super::{ConnectReturnCode, Error, SubscribeReturnCodes, SubscribeTopic};
 use super::{Header, LastWill, PacketIdentifier, PacketType, Protocol, QoS, MULTIPLIER};
-use bytes::{Bytes,BytesMut,BufMut,Buf};
+use bytes::{Buf, BufMut, BytesMut, IntoBuf};
 use std::sync::Arc;
-use std::io;
+use tokio_io::codec::{Decoder, Encoder};
 
 struct MqttCodec {}
-
-pub trait Decoder {
-    type Item;
-    type Error: From<io::Error>;
-    fn decode(&mut self, src: &mut Bytes) -> Result<Option<Self::Item>, Self::Error>;
-}
-
-pub trait Encoder {
-    type Item;
-    type Error: From<io::Error>;
-    fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error>;
-}
-
 
 impl Decoder for MqttCodec {
     type Item = Packet;
     type Error = super::Error;
 
-    fn decode(&mut self, src: &mut Bytes) -> Result<Option<Self::Item>, Self::Error> {
-        match self.read_packet(src) {
-            Err(Error::UnexpectedEof) => Ok(None),
-            Ok(packet) => Ok(Some(packet)),
-            Err(e) => Err(e),
-        }
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        self.read_packet(src)
     }
 }
 
@@ -38,68 +21,80 @@ impl Encoder for MqttCodec {
     type Error = super::Error;
 
     fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        self.write_packet(dst,&item)
+        self.write_packet(dst, &item)
     }
 }
 
 impl MqttCodec {
-    fn read_packet(&mut self, buf: &Bytes) -> Result<Packet, Error> {
-        let hd = buf.get_u8()?;
-        let len = self.read_remaining_length(buf)?;
-        let header = Header::new(hd, len)?;
-        if len == 0 {
-            // no payload packets
-            return match header.typ {
-                PacketType::Pingreq => Ok(Packet::Pingreq),
-                PacketType::Pingresp => Ok(Packet::Pingresp),
-                _ => Err(Error::PayloadRequired),
-            };
-        }
-        let mut raw_packet = buf.take(len as usize);
+    fn read_packet(&mut self, bytes: &BytesMut) -> Result<Option<Packet>, Error> {
+        let (header, mut buf, len) = match (bytes.get(0), self.read_remaining_length(bytes)) {
+            (Some(hd), Ok(Some((len_len, len)))) => {
+                let header = Header::new(*hd, len)?;
+                if len == 0 {
+                    // no payload packets
+                    return match header.typ {
+                        PacketType::Pingreq => Ok(Some(Packet::Pingreq)),
+                        PacketType::Pingresp => Ok(Some(Packet::Pingresp)),
+                        _ => Err(Error::PayloadRequired),
+                    };
+                } else {
+                    //Total packet length is header byte, plus variable length size, plus that size
+                    if bytes.len() != (len_len + len + 1) {
+                        return Ok(None);
+                    };
+
+                    Ok((header, bytes.into_buf(), len))
+                }
+            }
+            (None, _) | (_,Ok(None)) => return Ok(None),
+            (_, Err(e)) => Err(e),
+        }?;
 
         match header.typ {
-            PacketType::Connect => Ok(Packet::Connect(self.read_connect(buf,header)?)),
-            PacketType::Connack => Ok(Packet::Connack(self.read_connack(buf,header)?)),
-            PacketType::Publish => Ok(Packet::Publish(self.read_publish(buf,header)?)),
+            PacketType::Connect => Ok(Some(Packet::Connect(self.read_connect(&mut buf, header)?))),
+            PacketType::Connack => Ok(Some(Packet::Connack(self.read_connack(&mut buf, header)?))),
+            PacketType::Publish => Ok(Some(Packet::Publish(self.read_publish(&mut buf, header)?))),
             PacketType::Puback => {
                 if len != 2 {
                     return Err(Error::PayloadSizeIncorrect);
                 }
-                let pid = raw_packet.get_u16_be()?;
-                Ok(Packet::Puback(PacketIdentifier(pid)))
+                let pid = buf.get_u16_be();
+                Ok(Some(Packet::Puback(PacketIdentifier(pid))))
             }
             PacketType::Pubrec => {
                 if len != 2 {
                     return Err(Error::PayloadSizeIncorrect);
                 }
-                let pid = raw_packet.get_u16_be()?;
-                Ok(Packet::Pubrec(PacketIdentifier(pid)))
+                let pid = buf.get_u16_be();
+                Ok(Some(Packet::Pubrec(PacketIdentifier(pid))))
             }
             PacketType::Pubrel => {
                 if len != 2 {
                     return Err(Error::PayloadSizeIncorrect);
                 }
-                let pid = raw_packet.get_u16_be()?;
-                Ok(Packet::Pubrel(PacketIdentifier(pid)))
+                let pid = buf.get_u16_be();
+                Ok(Some(Packet::Pubrel(PacketIdentifier(pid))))
             }
             PacketType::Pubcomp => {
                 if len != 2 {
                     return Err(Error::PayloadSizeIncorrect);
                 }
-                let pid = raw_packet.get_u16_be()?;
-                Ok(Packet::Pubcomp(PacketIdentifier(pid)))
+                let pid = buf.get_u16_be();
+                Ok(Some(Packet::Pubcomp(PacketIdentifier(pid))))
             }
-            PacketType::Subscribe => Ok(Packet::Subscribe(raw_packet.read_subscribe(header)?)),
-            PacketType::Suback => Ok(Packet::Suback(raw_packet.read_suback(header)?)),
-            PacketType::Unsubscribe => {
-                Ok(Packet::Unsubscribe(raw_packet.read_unsubscribe(header)?))
+            PacketType::Subscribe => {
+                Ok(Some(Packet::Subscribe(self.read_subscribe(&mut buf, header)?)))
             }
+            PacketType::Suback => Ok(Some(Packet::Suback(self.read_suback(&mut buf, header)?))),
+            PacketType::Unsubscribe => Ok(Some(Packet::Unsubscribe(
+                self.read_unsubscribe(&mut buf, header)?,
+            ))),
             PacketType::Unsuback => {
                 if len != 2 {
                     return Err(Error::PayloadSizeIncorrect);
                 }
-                let pid = raw_packet.get_u16_be()?;
-                Ok(Packet::Unsuback(PacketIdentifier(pid)))
+                let pid = buf.get_u16_be();
+                Ok(Some(Packet::Unsuback(PacketIdentifier(pid))))
             }
             PacketType::Pingreq => Err(Error::IncorrectPacketFormat),
             PacketType::Pingresp => Err(Error::IncorrectPacketFormat),
@@ -107,14 +102,14 @@ impl MqttCodec {
         }
     }
 
-    fn read_connect(&mut self, buf: &Buf, _: Header) -> Result<Box<Connect>, Error> {
-        let protocol_name = self.read_mqtt_string(buf);
+    fn read_connect(&mut self, buf: &mut Buf, _: Header) -> Result<Box<Connect>, Error> {
+        let protocol_name = self.read_mqtt_string(buf)?;
         let protocol_level = buf.get_u8();
         let protocol = Protocol::new(protocol_name.as_ref(), protocol_level)?;
 
         let connect_flags = buf.get_u8();
         let keep_alive = buf.get_u16_be();
-        let client_id = self.read_mqtt_string(buf);
+        let client_id = self.read_mqtt_string(buf)?;
 
         let last_will = match connect_flags & 0b100 {
             0 => {
@@ -124,8 +119,8 @@ impl MqttCodec {
                 None
             }
             _ => {
-                let will_topic = self.read_mqtt_string(buf);
-                let will_message = self.read_mqtt_string(buf);
+                let will_topic = self.read_mqtt_string(buf)?;
+                let will_message = self.read_mqtt_string(buf)?;
                 let will_qod = QoS::from_u8((connect_flags & 0b11000) >> 3)?;
                 Some(LastWill {
                     topic: will_topic,
@@ -157,28 +152,28 @@ impl MqttCodec {
         }))
     }
 
-    fn read_connack(&mut self, buf: &Buf, header: Header) -> Result<Connack, Error> {
+    fn read_connack(&mut self, buf: &mut Buf, header: Header) -> Result<Connack, Error> {
         if header.len != 2 {
             return Err(Error::PayloadSizeIncorrect);
         }
-        let flags = buf.get_u8()?;
-        let return_code = buf.get_u8()?;
+        let flags = buf.get_u8();
+        let return_code = buf.get_u8();
         Ok(Connack {
             session_present: (flags & 0x01) == 1,
             code: ConnectReturnCode::from_u8(return_code)?,
         })
     }
 
-    fn read_publish(&mut self, buf: &Buf, header: Header) -> Result<Box<Publish>, Error> {
+    fn read_publish(&mut self, buf: &mut Buf, header: Header) -> Result<Box<Publish>, Error> {
         let topic_name = self.read_mqtt_string(buf);
         // Packet identifier exists where QoS > 0
         let pid = if header.qos().unwrap() != QoS::AtMostOnce {
-            Some(PacketIdentifier(buf.get_u16_be()?))
+            Some(PacketIdentifier(buf.get_u16_be()))
         } else {
             None
         };
         let mut payload = Vec::new();
-        self.read_to_end(&mut payload)?;
+        buf.copy_to_slice(&mut payload);
 
         Ok(Box::new(Publish {
             dup: header.dup(),
@@ -190,14 +185,14 @@ impl MqttCodec {
         }))
     }
 
-    fn read_subscribe(&mut self, buf: &BufMut, header: Header) -> Result<Box<Subscribe>, Error> {
-        let pid = buf.get_u16_be()?;
+    fn read_subscribe(&mut self, buf: &mut Buf, header: Header) -> Result<Box<Subscribe>, Error> {
+        let pid = buf.get_u16_be();
         let mut remaining_bytes = header.len - 2;
         let mut topics = Vec::with_capacity(1);
 
         while remaining_bytes > 0 {
             let topic_filter = self.read_mqtt_string(buf)?;
-            let requested_qod = buf.get_u8()?;
+            let requested_qod = buf.get_u8();
             remaining_bytes -= topic_filter.len() + 3;
             topics.push(SubscribeTopic {
                 topic_path: topic_filter,
@@ -211,7 +206,7 @@ impl MqttCodec {
         }))
     }
 
-    fn read_suback(&mut self, buf: &Buf, header: Header) -> Result<Box<Suback>, Error> {
+    fn read_suback(&mut self, buf: &mut Buf, header: Header) -> Result<Box<Suback>, Error> {
         let pid = buf.get_u16_be();
         let mut remaining_bytes = header.len - 2;
         let mut return_codes = Vec::with_capacity(remaining_bytes);
@@ -234,17 +229,13 @@ impl MqttCodec {
         }))
     }
 
-    fn read_unsubscribe(
-        &mut self,
-        buf: &Buf,
-        header: Header,
-    ) -> Result<Box<Unsubscribe>, Error> {
+    fn read_unsubscribe(&mut self, buf: &mut Buf, header: Header) -> Result<Box<Unsubscribe>, Error> {
         let pid = buf.get_u16_be();
         let mut remaining_bytes = header.len - 2;
         let mut topics = Vec::with_capacity(1);
 
         while remaining_bytes > 0 {
-            let topic_filter = self.read_mqtt_string(buf);
+            let topic_filter = self.read_mqtt_string(buf)?;
             remaining_bytes -= topic_filter.len() + 2;
             topics.push(topic_filter);
         }
@@ -255,41 +246,41 @@ impl MqttCodec {
         }))
     }
 
-    fn read_payload(&mut self, buf: &Buf, len: usize) -> Result<Box<Vec<u8>>, Error> {
-        let mut payload = Box::new(Vec::with_capacity(len));
-        buf.take(len as u64).read_to_end(&mut *payload)?;
-        Ok(payload)
-    }
-
-    fn read_mqtt_string(&mut self, buf: &Buf) -> Result<String, Error> {
+    fn read_mqtt_string(&mut self, buf: &mut Buf) -> Result<String, Error> {
         let len = buf.get_u16_be() as usize;
         let mut data = Vec::with_capacity(len);
-        buf.take(len as u64).read_to_end(&mut data);
-        Ok(String::from_utf8_lossy(data))
+        buf.copy_to_slice(&mut data);
+        Ok(String::from_utf8_lossy(&data).to_string())
     }
 
-    fn read_remaining_length(&mut self, buf: &Buf) -> Result<usize, Error> {
+    fn read_remaining_length(&mut self, bytes: &BytesMut) -> Result<Option<(usize, usize)>, Error> {
+        let mut index: usize = 1;
         let mut mult: usize = 1;
         let mut len: usize = 0;
         let mut done = false;
 
         while !done {
-            let byte = buf.get_u8()? as usize;
-            len += (byte & 0x7F) * mult;
-            mult *= 0x80;
-            if mult > MULTIPLIER {
-                return Err(Error::MalformedRemainingLength);
+            match bytes.get(index) {
+                Some(byte) => {
+                    index += 1usize;
+                    len += ((byte & 0x7F) as usize) * mult;
+                    mult *= 0x80;
+                    if mult > MULTIPLIER {
+                        return Err(Error::MalformedRemainingLength);
+                    }
+                    done = (byte & 0x80) == 0
+                }
+                None => return Ok(None),
             }
-            done = (byte & 0x80) == 0
         }
 
-        Ok(len)
+        Ok(Some((index - 1usize, len)))
     }
 
-    fn write_packet(&mut self, buf: &BufMut, packet: &Packet) -> Result<(), Error> {
+    fn write_packet(&mut self, buf: &mut BufMut, packet: &Packet) -> Result<(), Error> {
         match packet {
             &Packet::Connect(ref connect) => {
-                buf.put_u8(0b00010000)?;
+                buf.put_u8(0b00010000);
                 let prot_name = connect.protocol.name();
                 let mut len = 8 + prot_name.len() + connect.client_id.len();
                 if let Some(ref last_will) = connect.last_will {
@@ -301,9 +292,9 @@ impl MqttCodec {
                 if let Some(ref password) = connect.password {
                     len += 2 + password.len();
                 }
-                self.write_remaining_length(buf, len)?;
-                self.write_mqtt_string(buf, prot_name)?;
-                buf.put_u8(connect.protocol.level())?;
+                self.write_remaining_length(buf, len);
+                self.write_mqtt_string(buf, prot_name);
+                buf.put_u8(connect.protocol.level());
                 let mut connect_flags = 0;
                 if connect.clean_session {
                     connect_flags |= 0x02;
@@ -321,18 +312,18 @@ impl MqttCodec {
                 if let Some(_) = connect.username {
                     connect_flags |= 0x80;
                 }
-                buf.put_u8(connect_flags)?;
-                buf.put_u16_be(connect.keep_alive)?;
-                self.write_mqtt_string(buf, connect.client_id.as_ref())?;
+                buf.put_u8(connect_flags);
+                buf.put_u16_be(connect.keep_alive);
+                self.write_mqtt_string(buf, connect.client_id.as_ref());
                 if let Some(ref last_will) = connect.last_will {
-                    self.write_mqtt_string(buf, last_will.topic.as_ref())?;
-                    self.write_mqtt_string(buf, last_will.message.as_ref())?;
+                    self.write_mqtt_string(buf, last_will.topic.as_ref());
+                    self.write_mqtt_string(buf, last_will.message.as_ref());
                 }
                 if let Some(ref username) = connect.username {
-                    self.write_mqtt_string(buf, username)?;
+                    self.write_mqtt_string(buf, username);
                 }
                 if let Some(ref password) = connect.password {
-                    self.write_mqtt_string(buf, password)?;
+                    self.write_mqtt_string(buf, password);
                 }
                 Ok(())
             }
@@ -342,7 +333,7 @@ impl MqttCodec {
                     0x02,
                     connack.session_present as u8,
                     connack.code.to_u8(),
-                ])?;
+                ]);
                 Ok(())
             }
             &Packet::Publish(ref publish) => {
@@ -356,8 +347,8 @@ impl MqttCodec {
                 if publish.qos != QoS::AtMostOnce && None != publish.pid {
                     len += 2;
                 }
-                self.write_remaining_length(len);
-                self.write_mqtt_string(buf, publish.topic_name.as_str())?;
+                self.write_remaining_length(buf, len);
+                self.write_mqtt_string(buf, publish.topic_name.as_str());
                 if publish.qos != QoS::AtMostOnce {
                     if let Some(pid) = publish.pid {
                         buf.put_u16_be(pid.0);
@@ -392,7 +383,7 @@ impl MqttCodec {
                     .topics
                     .iter()
                     .fold(0, |s, ref t| s + t.topic_path.len() + 3);
-                self.write_remaining_length(buf,len);
+                self.write_remaining_length(buf, len);
                 buf.put_u16_be(subscribe.pid.0);
                 for topic in subscribe.topics.as_ref() as &Vec<SubscribeTopic> {
                     self.write_mqtt_string(buf, topic.topic_path.as_str());
@@ -401,8 +392,8 @@ impl MqttCodec {
                 Ok(())
             }
             &Packet::Suback(ref suback) => {
-                buf.put_slice(&[0x90])?;
-                self.write_remaining_length(suback.return_codes.len() + 2);
+                buf.put_slice(&[0x90]);
+                self.write_remaining_length(buf, suback.return_codes.len() + 2);
                 buf.put_u16_be(suback.pid.0);
                 let payload: Vec<u8> = suback
                     .return_codes
@@ -423,7 +414,7 @@ impl MqttCodec {
                     .topics
                     .iter()
                     .fold(0, |s, ref topic| s + topic.len() + 2);
-                self.write_remaining_length(len);
+                self.write_remaining_length(buf, len);
                 buf.put_u16_be(unsubscribe.pid.0);
                 for topic in unsubscribe.topics.as_ref() as &Vec<String> {
                     self.write_mqtt_string(buf, topic.as_str());
@@ -450,12 +441,12 @@ impl MqttCodec {
         }
     }
 
-    fn write_mqtt_string(&mut self, buf: &BytesMut, string: &str) {
+    fn write_mqtt_string(&mut self, buf: &mut BufMut, string: &str) {
         buf.put_u16_be(string.len() as u16);
         buf.put_slice(string.as_bytes());
     }
 
-    fn write_remaining_length(&mut self, buf: &BytesMut, len: usize)  {
+    fn write_remaining_length(&mut self, buf: &mut BufMut, len: usize) {
         let mut done = false;
         let mut x = len;
 
