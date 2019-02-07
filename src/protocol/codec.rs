@@ -1,11 +1,18 @@
-use super::mqtt::{Connack, Connect, Packet, Publish, Suback, Subscribe, Unsubscribe};
+use super::{Connack, Connect, Packet, Publish, Suback, Subscribe, Unsubscribe};
 use super::{ConnectReturnCode, Error, SubscribeReturnCodes, SubscribeTopic};
 use super::{Header, LastWill, PacketIdentifier, PacketType, Protocol, QoS, MULTIPLIER};
 use bytes::{Buf, BufMut, BytesMut, IntoBuf};
 use std::sync::Arc;
 use tokio_io::codec::{Decoder, Encoder};
 
-struct MqttCodec {}
+#[derive(Default)]
+pub struct MqttCodec {}
+
+impl MqttCodec {
+    pub fn new() -> Self {
+        MqttCodec::default()
+    }
+}
 
 impl Decoder for MqttCodec {
     type Item = Packet;
@@ -46,7 +53,7 @@ impl MqttCodec {
                     Ok((header, bytes.into_buf(), len))
                 }
             }
-            (None, _) | (_,Ok(None)) => return Ok(None),
+            (None, _) | (_, Ok(None)) => return Ok(None),
             (_, Err(e)) => Err(e),
         }?;
 
@@ -82,9 +89,9 @@ impl MqttCodec {
                 let pid = buf.get_u16_be();
                 Ok(Some(Packet::Pubcomp(PacketIdentifier(pid))))
             }
-            PacketType::Subscribe => {
-                Ok(Some(Packet::Subscribe(self.read_subscribe(&mut buf, header)?)))
-            }
+            PacketType::Subscribe => Ok(Some(Packet::Subscribe(
+                self.read_subscribe(&mut buf, header)?,
+            ))),
             PacketType::Suback => Ok(Some(Packet::Suback(self.read_suback(&mut buf, header)?))),
             PacketType::Unsubscribe => Ok(Some(Packet::Unsubscribe(
                 self.read_unsubscribe(&mut buf, header)?,
@@ -229,7 +236,11 @@ impl MqttCodec {
         }))
     }
 
-    fn read_unsubscribe(&mut self, buf: &mut Buf, header: Header) -> Result<Box<Unsubscribe>, Error> {
+    fn read_unsubscribe(
+        &mut self,
+        buf: &mut Buf,
+        header: Header,
+    ) -> Result<Box<Unsubscribe>, Error> {
         let pid = buf.get_u16_be();
         let mut remaining_bytes = header.len - 2;
         let mut topics = Vec::with_capacity(1);
@@ -465,16 +476,20 @@ impl MqttCodec {
 #[cfg(test)]
 mod test {
     use super::{
-        ConnectReturnCode, LastWill, PacketIdentifier, Protocol, QoS, SubscribeReturnCodes,
-        SubscribeTopic,
+        ConnectReturnCode, LastWill, MqttCodec, PacketIdentifier, Protocol, QoS,
+        SubscribeReturnCodes, SubscribeTopic,
     };
-    use mqtt::{Connack, Connect, Packet, Publish, Suback, Subscribe, Unsubscribe};
+    use crate::protocol::packet::{
+        Connack, Connect, Packet, Publish, Suback, Subscribe, Unsubscribe,
+    };
+    use bytes::BytesMut;
     use std::io::Cursor;
     use std::sync::Arc;
+    use tokio_codec::{Decoder, Encoder};
 
     #[test]
     fn read_packet_connect_mqtt_protocol_test() {
-        let mut stream = Cursor::new(vec![
+        let mut stream = BytesMut::from(vec![
             0x10, 39, 0x00, 0x04, 'M' as u8, 'Q' as u8, 'T' as u8, 'T' as u8, 0x04,
             0b11001110, // +username, +password, -will retain, will qos=1, +last_will, +clean_session
             0x00, 0x0a, // 10 sec
@@ -486,7 +501,7 @@ mod test {
             0x00, 0x02, 'm' as u8, 'q' as u8, // password = 'mq'
         ]);
 
-        let packet = stream.read_packet().unwrap();
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -509,7 +524,7 @@ mod test {
 
     #[test]
     fn read_packet_connect_mqisdp_protocol_test() {
-        let mut stream = Cursor::new(vec![
+        let mut bytes = BytesMut::from(vec![
             0x10, 18, 0x00, 0x06, 'M' as u8, 'Q' as u8, 'I' as u8, 's' as u8, 'd' as u8, 'p' as u8,
             0x03,
             0b00000000, // -username, -password, -will retain, will qos=0, -last_will, -clean_session
@@ -517,7 +532,7 @@ mod test {
             0x00, 0x04, 't' as u8, 'e' as u8, 's' as u8, 't' as u8, // client_id
         ]);
 
-        let packet = stream.read_packet().unwrap();
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -535,8 +550,9 @@ mod test {
 
     #[test]
     fn read_packet_connack_test() {
-        let mut stream = Cursor::new(vec![0b00100000, 0x02, 0x01, 0x00]);
-        let packet = stream.read_packet().unwrap();
+        let mut stream = BytesMut::from(vec![0b00100000, 0x02, 0x01, 0x00]);
+
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -549,13 +565,13 @@ mod test {
 
     #[test]
     fn read_packet_publish_qos1_test() {
-        let mut stream = Cursor::new(vec![
+        let mut stream = BytesMut::from(vec![
             0b00110010, 11, 0x00, 0x03, 'a' as u8, '/' as u8, 'b' as u8, // topic name = 'a/b'
             0x00, 0x0a, // pid = 10
             0xF1, 0xF2, 0xF3, 0xF4,
         ]);
 
-        let packet = stream.read_packet().unwrap();
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -572,12 +588,12 @@ mod test {
 
     #[test]
     fn read_packet_publish_qos0_test() {
-        let mut stream = Cursor::new(vec![
+        let mut stream = BytesMut::from(vec![
             0b00110000, 7, 0x00, 0x03, 'a' as u8, '/' as u8, 'b' as u8, // topic name = 'a/b'
             0x01, 0x02,
         ]);
 
-        let packet = stream.read_packet().unwrap();
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -594,15 +610,15 @@ mod test {
 
     #[test]
     fn read_packet_puback_test() {
-        let mut stream = Cursor::new(vec![0b01000000, 0x02, 0x00, 0x0A]);
-        let packet = stream.read_packet().unwrap();
+        let mut stream = BytesMut::from(vec![0b01000000, 0x02, 0x00, 0x0A]);
 
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
         assert_eq!(packet, Packet::Puback(PacketIdentifier(10)));
     }
 
     #[test]
     fn read_packet_subscribe_test() {
-        let mut stream = Cursor::new(vec![
+        let mut stream = BytesMut::from(vec![
             0b10000010, 20, 0x01, 0x04, // pid = 260
             0x00, 0x03, 'a' as u8, '/' as u8, '+' as u8, // topic filter = 'a/+'
             0x00,      // qos = 0
@@ -613,7 +629,7 @@ mod test {
             0x02,      // qos = 2
         ]);
 
-        let packet = stream.read_packet().unwrap();
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -639,7 +655,7 @@ mod test {
 
     #[test]
     fn read_packet_unsubscribe_test() {
-        let mut stream = Cursor::new(vec![
+        let mut stream = BytesMut::from(vec![
             0b10100010, 17, 0x00, 0x0F, // pid = 15
             0x00, 0x03, 'a' as u8, '/' as u8, '+' as u8, // topic filter = 'a/+'
             0x00, 0x01, '#' as u8, // topic filter = '#'
@@ -647,7 +663,7 @@ mod test {
             'c' as u8, // topic filter = 'a/b/c'
         ]);
 
-        let packet = stream.read_packet().unwrap();
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -660,12 +676,12 @@ mod test {
 
     #[test]
     fn read_packet_suback_test() {
-        let mut stream = Cursor::new(vec![
+        let mut stream = BytesMut::from(vec![
             0x90, 4, 0x00, 0x0F, // pid = 15
             0x01, 0x80,
         ]);
 
-        let packet = stream.read_packet().unwrap();
+        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -696,11 +712,12 @@ mod test {
             password: Some("mq".to_owned()),
         }));
 
-        let mut stream = Cursor::new(Vec::new());
-        stream.write_packet(&connect).unwrap();
+        let mut vec = vec![];
+        let mut stream = BytesMut::from(&mut vec);
+        MqttCodec::new().encode(&connect,&mut stream).unwrap();
 
         assert_eq!(
-            stream.get_ref().clone(),
+            vec,
             vec![
                 0x10, 39, 0x00, 0x04, 'M' as u8, 'Q' as u8, 'T' as u8, 'T' as u8, 0x04,
                 0b11001110, // +username, +password, -will retain, will qos=1, +last_will, +clean_session

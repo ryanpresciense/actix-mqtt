@@ -1,6 +1,6 @@
 mod codec;
 mod error;
-mod mqtt;
+mod packet;
 mod msg;
 mod topic;
 
@@ -8,7 +8,7 @@ pub use error::Error;
 
 pub use msg::Message;
 
-pub use mqtt::{
+pub use packet::{
     Connack, Connect, Packet, Publish, Suback, Subscribe, SubscribeReturnCodes, SubscribeTopic,
     Unsubscribe,
 };
@@ -16,7 +16,6 @@ pub use mqtt::{
 pub use topic::{ToTopicPath, Topic, TopicPath};
 
 const MULTIPLIER: usize = 0x80 * 0x80 * 0x80 * 0x80;
-const MAX_PAYLOAD_SIZE: usize = 268435455;
 
 use std::fmt;
 

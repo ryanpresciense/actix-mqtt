@@ -1,6 +1,6 @@
 mod iostream;
 pub mod connector;
-mod protocol;
+pub mod protocol;
 
 
 #[cfg(test)]
