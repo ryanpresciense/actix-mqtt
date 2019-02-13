@@ -532,7 +532,7 @@ mod test {
             0x00, 0x04, 't' as u8, 'e' as u8, 's' as u8, 't' as u8, // client_id
         ]);
 
-        let packet = MqttCodec::new().decode(&mut stream).unwrap().unwrap();
+        let packet = MqttCodec::new().decode(&mut bytes).unwrap().unwrap();
 
         assert_eq!(
             packet,
@@ -712,12 +712,11 @@ mod test {
             password: Some("mq".to_owned()),
         }));
 
-        let mut vec = vec![];
-        let mut stream = BytesMut::from(&mut vec);
-        MqttCodec::new().encode(&connect,&mut stream).unwrap();
+        let mut stream = BytesMut::new();
+        MqttCodec::new().encode(connect, &mut stream).unwrap();
 
         assert_eq!(
-            vec,
+            Vec::from(stream.as_ref()),
             vec![
                 0x10, 39, 0x00, 0x04, 'M' as u8, 'Q' as u8, 'T' as u8, 'T' as u8, 0x04,
                 0b11001110, // +username, +password, -will retain, will qos=1, +last_will, +clean_session
@@ -744,11 +743,11 @@ mod test {
             password: None,
         }));
 
-        let mut stream = Cursor::new(Vec::new());
-        stream.write_packet(&connect).unwrap();
+        let mut stream = BytesMut::new();
+        MqttCodec::new().encode(connect, &mut stream).unwrap();
 
         assert_eq!(
-            stream.get_ref().clone(),
+            Vec::from(stream.as_ref()),
             vec![
                 0x10, 18, 0x00, 0x06, 'M' as u8, 'Q' as u8, 'I' as u8, 's' as u8, 'd' as u8,
                 'p' as u8, 0x03,
@@ -766,10 +765,13 @@ mod test {
             code: ConnectReturnCode::Accepted,
         });
 
-        let mut stream = Cursor::new(Vec::new());
-        stream.write_packet(&connack).unwrap();
+        let mut stream = BytesMut::new();
+        MqttCodec::new().encode(connack, &mut stream).unwrap();
 
-        assert_eq!(stream.get_ref().clone(), vec![0b00100000, 0x02, 0x01, 0x00]);
+        assert_eq!(
+            Vec::from(stream.as_ref()),
+            vec![0b00100000, 0x02, 0x01, 0x00]
+        );
     }
 
     #[test]
@@ -783,11 +785,11 @@ mod test {
             payload: Arc::new(vec![0xF1, 0xF2, 0xF3, 0xF4]),
         }));
 
-        let mut stream = Cursor::new(Vec::new());
-        stream.write_packet(&publish).unwrap();
+        let mut stream = BytesMut::new();
+        MqttCodec::new().encode(publish, &mut stream).unwrap();
 
         assert_eq!(
-            stream.get_ref().clone(),
+            Vec::from(stream.as_ref()),
             vec![
                 0b00110010, 11, 0x00, 0x03, 'a' as u8, '/' as u8, 'b' as u8, 0x00, 0x0a, 0xF1,
                 0xF2, 0xF3, 0xF4
@@ -806,11 +808,11 @@ mod test {
             payload: Arc::new(vec![0xE1, 0xE2, 0xE3, 0xE4]),
         }));
 
-        let mut stream = Cursor::new(Vec::new());
-        stream.write_packet(&publish).unwrap();
+        let mut stream = BytesMut::new();
+        MqttCodec::new().encode(publish, &mut stream).unwrap();
 
         assert_eq!(
-            stream.get_ref().clone(),
+            Vec::from(stream.as_ref()),
             vec![
                 0b00110000, 9, 0x00, 0x03, 'a' as u8, '/' as u8, 'b' as u8, 0xE1, 0xE2, 0xE3, 0xE4
             ]
@@ -837,11 +839,11 @@ mod test {
             ],
         }));
 
-        let mut stream = Cursor::new(Vec::new());
-        stream.write_packet(&subscribe).unwrap();
+        let mut stream = BytesMut::new();
+        MqttCodec::new().encode(subscribe, &mut stream).unwrap();
 
         assert_eq!(
-            stream.get_ref().clone(),
+            Vec::from(stream.as_ref()),
             vec![
                 0b10000010, 20, 0x01, 0x04, // pid = 260
                 0x00, 0x03, 'a' as u8, '/' as u8, '+' as u8, // topic filter = 'a/+'

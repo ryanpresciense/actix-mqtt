@@ -67,7 +67,8 @@ impl Message {
 #[cfg(test)]
 mod test {
     use super::Message;
-    use super::{PacketIdentifier, Publish, QoS, ToTopicPath};
+    use super::{PacketIdentifier, Publish, QoS};
+    use crate::protocol::topic::ToTopicPath;
     use std::sync::Arc;
 
     #[test]
