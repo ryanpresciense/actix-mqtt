@@ -33,7 +33,7 @@ impl Encoder for MqttCodec {
 }
 
 impl MqttCodec {
-    fn read_packet(&mut self, bytes: &BytesMut) -> Result<Option<Packet>, Error> {
+    fn read_packet(&mut self, bytes: &mut BytesMut) -> Result<Option<Packet>, Error> {
         let (header, mut buf, len) = match (bytes.get(0), self.read_remaining_length(bytes)) {
             (Some(hd), Ok(Some((len_len, len)))) => {
                 let header = Header::new(*hd, len)?;
@@ -45,17 +45,18 @@ impl MqttCodec {
                         _ => Err(Error::PayloadRequired),
                     };
                 } else {
-                    //Total packet length is header byte, plus variable length size, plus that size
-                    if bytes.len() != (len_len + len + 1) {
+                    //Total packet length is header byte, plus variable length size
+                    if bytes.len() != (len_len + len) {
                         return Ok(None);
                     };
 
-                    Ok((header, bytes.into_buf(), len))
+                    Ok((header, bytes.split_off(len_len).into_buf(), len))
                 }
             }
             (None, _) | (_, Ok(None)) => return Ok(None),
             (_, Err(e)) => Err(e),
         }?;
+
 
         match header.typ {
             PacketType::Connect => Ok(Some(Packet::Connect(self.read_connect(&mut buf, header)?))),
@@ -172,21 +173,23 @@ impl MqttCodec {
     }
 
     fn read_publish(&mut self, buf: &mut Buf, header: Header) -> Result<Box<Publish>, Error> {
-        let topic_name = self.read_mqtt_string(buf);
+        let topic_name = self.read_mqtt_string(buf)?;
         // Packet identifier exists where QoS > 0
-        let pid = if header.qos().unwrap() != QoS::AtMostOnce {
-            Some(PacketIdentifier(buf.get_u16_be()))
+        let (pid,payload_len) = if header.qos().unwrap() != QoS::AtMostOnce {
+            (Some(PacketIdentifier(buf.get_u16_be())),
+             header.len - (topic_name.len() + 4usize))
         } else {
-            None
+            (None,header.len - (topic_name.len() + 2usize))
         };
-        let mut payload = Vec::new();
+
+        let mut payload = vec![0u8;payload_len];
         buf.copy_to_slice(&mut payload);
 
         Ok(Box::new(Publish {
             dup: header.dup(),
             qos: header.qos()?,
             retain: header.retain(),
-            topic_name: topic_name?,
+            topic_name: topic_name,
             pid: pid,
             payload: Arc::new(payload),
         }))
@@ -257,9 +260,13 @@ impl MqttCodec {
         }))
     }
 
+    /// # Read an MQTT string from `buf`
+    /// MQTT strings are UTF8, prefixed with 16 bit length
+    /// TODO: Zero copy
+    /// [link][http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718016]
     fn read_mqtt_string(&mut self, buf: &mut Buf) -> Result<String, Error> {
         let len = buf.get_u16_be() as usize;
-        let mut data = Vec::with_capacity(len);
+        let mut data = vec![0u8;len];
         buf.copy_to_slice(&mut data);
         Ok(String::from_utf8_lossy(&data).to_string())
     }
@@ -285,10 +292,10 @@ impl MqttCodec {
             }
         }
 
-        Ok(Some((index - 1usize, len)))
+        Ok(Some((index, len)))
     }
 
-    fn write_packet(&mut self, buf: &mut BufMut, packet: &Packet) -> Result<(), Error> {
+    fn write_packet(&mut self, buf: &mut BytesMut, packet: &Packet) -> Result<(), Error> {
         match packet {
             &Packet::Connect(ref connect) => {
                 buf.put_u8(0b00010000);
@@ -365,6 +372,7 @@ impl MqttCodec {
                         buf.put_u16_be(pid.0);
                     }
                 }
+                buf.reserve(publish.payload.len());
                 buf.put_slice(&publish.payload.as_ref());
                 Ok(())
             }
@@ -457,7 +465,8 @@ impl MqttCodec {
         buf.put_slice(string.as_bytes());
     }
 
-    fn write_remaining_length(&mut self, buf: &mut BufMut, len: usize) {
+    fn write_remaining_length(&mut self, buf: &mut BytesMut, len: usize) {
+        buf.reserve(len + 4usize);
         let mut done = false;
         let mut x = len;
 
@@ -470,6 +479,7 @@ impl MqttCodec {
             buf.put_u8(byte);
             done = x <= 0;
         }
+
     }
 }
 
@@ -483,9 +493,30 @@ mod test {
         Connack, Connect, Packet, Publish, Suback, Subscribe, Unsubscribe,
     };
     use bytes::BytesMut;
-    use std::io::Cursor;
     use std::sync::Arc;
     use tokio_codec::{Decoder, Encoder};
+
+
+    #[test]
+    fn read_packet_length() {
+        let mut stream = BytesMut::from(vec![
+            0x10, 39, 0x00, 0x04, 'M' as u8, 'Q' as u8, 'T' as u8, 'T' as u8, 0x04,
+            0b11001110, // +username, +password, -will retain, will qos=1, +last_will, +clean_session
+            0x00, 0x0a, // 10 sec
+            0x00, 0x04, 't' as u8, 'e' as u8, 's' as u8, 't' as u8, // client_id
+            0x00, 0x02, '/' as u8, 'a' as u8, // will topic = '/a'
+            0x00, 0x07, 'o' as u8, 'f' as u8, 'f' as u8, 'l' as u8, 'i' as u8, 'n' as u8,
+            'e' as u8, // will msg = 'offline'
+            0x00, 0x04, 'r' as u8, 'u' as u8, 's' as u8, 't' as u8, // username = 'rust'
+            0x00, 0x02, 'm' as u8, 'q' as u8, // password = 'mq'
+        ]);
+
+        assert_eq!(
+            (2usize,39),
+            MqttCodec::new().read_remaining_length(&mut stream).unwrap().unwrap()
+        );
+    }
+
 
     #[test]
     fn read_packet_connect_mqtt_protocol_test() {
